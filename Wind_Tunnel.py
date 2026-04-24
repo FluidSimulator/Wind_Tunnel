@@ -400,6 +400,176 @@ class SmokeUpsampleNet(nn.Module):
         return self.decode(self.upsample(self.encode(x)))
 
 
+def save_training_dataset_csv(inp, tgt, filename="training_dataset.csv"):
+    """
+    Export the (coarse_input, fine_target) pairs used to train the CNN to CSV.
+
+    File goes next to this script (Wind_Tunnel folder), regardless of cwd.
+
+    Format: one row per training frame, wide layout. Columns are ordered so
+    the plume rows (where smoke actually lives) come FIRST after `frame`, so
+    non-zero values are visible in the first visible columns of the CSV:
+
+        frame,
+        coarse_r22_c0 .. coarse_r27_c99,     (10 plume rows of 50x100 coarse)
+        coarse_r0_c0  .. coarse_r21_c99,     (remaining coarse rows)
+        coarse_r28_c0 .. coarse_r49_c99,
+        fine_r45_c0   .. fine_r54_c199,      (10 plume rows of 100x200 fine)
+        fine_r0_c0    .. fine_r44_c199,      (remaining fine rows)
+        fine_r55_c0   .. fine_r99_c199
+
+    Pixel values are smoke densities in [0, 1]. Coarse = avg_pool2d(fine, 2).
+
+    Also drops `training_dataset_sample_frame.csv` -- one frame of the fine
+    grid written as a natural 100x200 2D table so you can open it and see
+    the smoke pattern at a glance.
+    """
+    import csv
+
+    try:
+        folder = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        folder = os.getcwd()
+
+    # Detach from autograd, force CPU + contiguous memory, copy to float32.
+    inp_np = (inp.detach().cpu().contiguous()
+                 .squeeze(1).numpy().astype(np.float32, copy=True))
+    tgt_np = (tgt.detach().cpu().contiguous()
+                 .squeeze(1).numpy().astype(np.float32, copy=True))
+    n, ch, cw = inp_np.shape
+    _, fh, fw = tgt_np.shape
+
+    nz_i = int(np.count_nonzero(inp_np))
+    nz_t = int(np.count_nonzero(tgt_np))
+    mid  = n // 2
+
+    print("  " + "=" * 60)
+    print("  [ML] Dataset stats (pre-write -- trust these, not a spot-check)")
+    print(f"       coarse {inp_np.shape}: "
+          f"min={inp_np.min():.4f}  max={inp_np.max():.4f}  "
+          f"mean={inp_np.mean():.4f}  nonzero={nz_i}/{inp_np.size}")
+    print(f"       fine   {tgt_np.shape}: "
+          f"min={tgt_np.min():.4f}  max={tgt_np.max():.4f}  "
+          f"mean={tgt_np.mean():.4f}  nonzero={nz_t}/{tgt_np.size}")
+    print(f"       sample plume pixels from frame {mid}:")
+    print(f"         fine[r=50, c=  5] = {tgt_np[mid, 50,   5]:.4f}   (near inflow)")
+    print(f"         fine[r=50, c=100] = {tgt_np[mid, 50, 100]:.4f}   (mid-domain)")
+    print(f"         fine[r=50, c=190] = {tgt_np[mid, 50, 190]:.4f}   (downstream)")
+    print(f"         fine[r= 0, c=  0] = {tgt_np[mid,  0,   0]:.4f}   (top wall)")
+    print("  " + "=" * 60)
+
+    if nz_i == 0 and nz_t == 0:
+        print("  [ML] Training tensors are entirely zero -- skipping CSV.")
+        return
+
+    # ---- Column reordering: plume rows first so non-zero data is visible ----
+    # Coarse plume: rows 22..27 (avg-pool of fine rows 45..54).
+    # Fine plume:  rows 45..54 (smoke inflow slit).
+    c_plume = list(range(22, 28))
+    c_rest  = [r for r in range(ch) if r not in c_plume]
+    c_order = c_plume + c_rest
+    f_plume = list(range(45, 55))
+    f_rest  = [r for r in range(fh) if r not in f_plume]
+    f_order = f_plume + f_rest
+
+    # Reorder along the row axis (axis=1), then flatten per frame.
+    inp_reord = np.ascontiguousarray(inp_np[:, c_order, :])  # (n, ch, cw)
+    tgt_reord = np.ascontiguousarray(tgt_np[:, f_order, :])  # (n, fh, fw)
+    inp_flat  = inp_reord.reshape(n, -1)
+    tgt_flat  = tgt_reord.reshape(n, -1)
+
+    header = ["frame"]
+    header += [f"coarse_r{r}_c{c}" for r in c_order for c in range(cw)]
+    header += [f"fine_r{r}_c{c}"   for r in f_order for c in range(fw)]
+
+    def _write_main(target_path):
+        with open(target_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for k in range(n):
+                row = [k]
+                row.extend(f"{float(v):.6f}" for v in inp_flat[k].tolist())
+                row.extend(f"{float(v):.6f}" for v in tgt_flat[k].tolist())
+                w.writerow(row)
+
+    # ---- Write main dataset ----
+    primary_path = os.path.join(folder, filename)
+    t0 = time.perf_counter()
+    main_path = primary_path
+    try:
+        _write_main(main_path)
+    except PermissionError:
+        stem, ext = os.path.splitext(filename)
+        main_path = os.path.join(folder, f"{stem}_{int(time.time())}{ext}")
+        print(f"  [ML] '{primary_path}' is locked. Writing to {main_path}")
+        try:
+            _write_main(main_path)
+        except OSError as e:
+            print(f"  [ML] Main CSV write failed: {e}. Training continues.")
+            main_path = None
+    except OSError as e:
+        print(f"  [ML] Main CSV write failed: {e}. Training continues.")
+        main_path = None
+
+    if main_path:
+        size_mb = os.path.getsize(main_path) / (1024 * 1024)
+        print(f"  [ML] Dataset -> {main_path}")
+        print(f"       {n} frames x {len(header)-1} features "
+              f"({size_mb:.1f} MB, {time.perf_counter()-t0:.1f}s)")
+        print(f"       First data columns are the smoke-plume rows -- "
+              f"look at columns 2..601 of any frame row for real values.")
+
+    # ---- Per-frame summary: small, presentable, physically meaningful ----
+    summary_path = os.path.join(folder, "training_dataset_summary.csv")
+    try:
+        with open(summary_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "frame", "time_s",
+                "coarse_min", "coarse_max", "coarse_mean", "coarse_nonzero_pct",
+                "fine_min",   "fine_max",   "fine_mean",   "fine_nonzero_pct",
+                "plume_inflow_avg", "plume_mid_avg", "plume_wake_avg",
+                "total_smoke_mass",
+            ])
+            for k in range(n):
+                cf = inp_np[k]                    # (50, 100)
+                ff = tgt_np[k]                    # (100, 200)
+                plume = ff[STREAM_LO:STREAM_HI]   # (10, 200), rows 45..54
+                inflow = float(plume[:,   :10 ].mean())
+                midxy  = float(plume[:, 95:105].mean())
+                wake   = float(plume[:, 190:   ].mean())
+                w.writerow([
+                    k,
+                    f"{k * DT:.4f}",
+                    f"{cf.min():.4f}",  f"{cf.max():.4f}",
+                    f"{cf.mean():.6f}", f"{np.count_nonzero(cf) / cf.size * 100:.2f}",
+                    f"{ff.min():.4f}",  f"{ff.max():.4f}",
+                    f"{ff.mean():.6f}", f"{np.count_nonzero(ff) / ff.size * 100:.2f}",
+                    f"{inflow:.4f}", f"{midxy:.4f}", f"{wake:.4f}",
+                    f"{ff.sum():.2f}",
+                ])
+        print(f"  [ML] Summary -> {summary_path}")
+        print(f"       {n} rows x 14 cols -- per-frame smoke stats for "
+              f"presentation / quick inspection.")
+    except OSError as e:
+        print(f"  [ML] Summary write failed (non-fatal): {e}")
+
+    # ---- Extra: one-frame 2D snapshot for obvious visual verification ----
+    sample_path = os.path.join(folder, "training_dataset_sample_frame.csv")
+    try:
+        with open(sample_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["row"] + [f"col_{c}" for c in range(fw)])
+            for r in range(fh):
+                w.writerow([r] + [f"{float(v):.4f}"
+                                  for v in tgt_np[mid, r].tolist()])
+        print(f"  [ML] Sample frame {mid} (fine, 100x200 2D) -> {sample_path}")
+        print(f"       Open this one to see the smoke field visually -- "
+              f"rows 45..54 should show non-zero values.")
+    except OSError as e:
+        print(f"  [ML] Sample-frame write failed (non-fatal): {e}")
+
+
 def try_compile(model):
     try:
         compiled = torch.compile(model)
@@ -661,6 +831,11 @@ def main():
             print(" [3/4] Training (background thread) ...")
             inp = torch.cat(train_in, 0)
             tgt = torch.cat(train_tgt, 0)
+            try:
+                save_training_dataset_csv(inp, tgt)
+            except Exception as _csv_err:
+                print(f"  [ML] CSV export raised {type(_csv_err).__name__}: "
+                      f"{_csv_err}. Training continues.")
             train_in.clear(); train_tgt.clear()
             _train_result.clear(); _train_event.clear()
 
